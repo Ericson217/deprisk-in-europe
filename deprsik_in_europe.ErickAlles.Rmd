@@ -1,0 +1,410 @@
+---
+title: "R-Skript"
+author: "Erick Alles"
+date: "2025-03-10"
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r, eval=FALSE, echo=TRUE}
+library(dplyr)
+library(tidyr)
+library(mice)
+library(ranger)
+library(performance)
+library(gtsummary)
+library(ggplot2)
+library(gt)
+```
+```{r, eval=FALSE, echo=TRUE}
+## Datenaufbereitung und Subgruppenerstellung
+# Datensatz easySHARE laden
+load("~/Statistikprogramm R/Seminar_Gesök/easySHARE_rel9-0-0.Rdata")
+
+#Auswahl der relevanten Variablen
+variables = c(
+  "mergeid", "wave", "female", "age", "isced1997_r", "mar_stat",
+  "hhsize", "ch001_", "ch021_mod", "ch007_hh", "mother_alive",
+  "father_alive", "sp002_mod", "sp008_",
+  "chronic_mod","bmi", "hc002_mod",
+  "iadlza","lgmuscle", "finemotor", 
+  "maxgrip", "ever_smoked","income_pct_w8", "co007_",
+  "ep005_", "recall_1", "orienti", "numeracy_2","eduyears_mod","bfi10_neuro_mod",
+  "bfi10_extra_mod", "bfi10_open_mod", "bfi10_consc_mod", "bfi10_agree_mod", "eurod")
+
+
+#Datensatz mit gewählten Variablen
+dataset = easySHARE_rel9[variables]
+
+
+#Datensatzvorbereitung für die folgende Analyse /Imputation
+dataset= dataset %>%
+  rename(depression = eurod)%>%
+  mutate(depression = if_else(depression >= 4, "Yes", "No")) %>%
+  mutate(across(c(mergeid, wave,depression),as.factor))
+# Kriterium für klinische Depression: eurod >= 4
+
+
+#Erstellung eines Subsets: Welle 8 mit nur Männern, welche 50 Jahre oder älter sind
+wave8_male = dataset %>%
+  filter(wave == "8", female == "male", age >= 50)%>%
+  select(-mergeid, -wave, -female)
+
+#Erstellung eines Subsets: Welle 8 mit nur Frauen, welche 50 Jahre oder älter sind
+wave8_female = dataset %>%
+  filter(wave == "8", female == "female", age >= 50)%>%
+  select(-mergeid, -wave, -female)
+# Nicht mehr notwendige Variablen wie ID, Welle und Geschlecht wurden entfernt
+
+
+#Ausreißer bereinigen
+wave8_female = wave8_female %>%
+  filter(ch021_mod <= 30, chronic_mod <= 5,
+         10 <= maxgrip & maxgrip <= 70, hc002_mod <= 40,
+         2 <= eduyears_mod & eduyears_mod <= 22)
+wave8_male = wave8_male %>%
+  filter(ch021_mod <= 30, chronic_mod <= 5,
+         10 <= maxgrip & maxgrip <= 70, hc002_mod <= 40,
+         2 <= eduyears_mod & eduyears_mod <= 22)
+
+# Zufallseed für die Reproduzierbarkeit
+set.seed(217)
+
+# Zufälliges Mischen des Datensatzes der Frauen
+wave8_female = wave8_female %>% sample_frac(1)
+# Aufteilen des gemischten Datensatzes in zwei gleich große Gruppen (A1, A2)
+female_A1 = slice_head(wave8_female, prop = 0.5)# Subsample A1 für RFA
+female_A2 = slice_tail(wave8_female, prop = 0.5)# Subsample A2 für logistische Regression
+
+# Zufälliges Mischen des Datensatzes der Männer
+wave8_male = wave8_male %>% sample_frac(1)
+# Aufteilen des gemischten Datensatzes in zwei gleich große Gruppen (A1, A2)
+male_A1 = slice_head(wave8_male, prop = 0.5)# Subsample A1 für RFA
+male_A2 = slice_tail(wave8_male, prop = 0.5) # Subsample A2 für logistische Regression
+```
+```{r, eval=FALSE, echo=TRUE}
+## Datenimputation 
+
+#für jedes Subsample 10 Imputationen, 35 Iterationen
+imp.female_A1 = mice(female_A1, m = 10, maxit = 35,
+                     seed = 217, print = FALSE)
+imp.male_A1 = mice(male_A1, m = 10, maxit = 35,
+                   seed = 217, print = FALSE)
+imp.female_A2 = mice(female_A2, m = 10, maxit = 35,
+                     seed = 217, print = FALSE)
+imp.male_A2 = mice(male_A2, m = 10, maxit = 35,
+                    seed = 217, print = FALSE)
+# Konvergenz und Dichteverteilung überprüfen (hier am Beispiel Frauen A1)
+plot(imp.female_A1)
+densityplot(imp.female_A1)
+
+```
+```{r, eval=FALSE, echo=TRUE}
+##Random Forest Analyse
+
+#RF-Modelle trainieren
+n_imputations = 10  # Anzahl der zu verwendenden Imputationen
+
+#RF-Modelle Männer
+rf_models_femA1 = list()
+for (i in 1:n_imputations) {
+  multi_data_femA1 = complete(imp.female_A1, action = i)
+  rf_models_femA1[[i]] = ranger(depression ~ ., data = multi_data_femA1, num.trees = 250, mtry = 12,
+                                probability = TRUE, importance = "permutation")}
+#RF-Modelle Frauen
+rf_models_maleA1 = list()
+for (j in 1:n_imputations) {
+  multi_data_maleA1 = complete(imp.male_A1, action = j)
+  rf_models_maleA1[[j]] = ranger(depression ~ ., data = multi_data_maleA1, num.trees = 250, mtry = 12,
+                                 probability = TRUE, importance = "permutation")}
+
+#OOB error berechnen Frauen A1 
+errors_femA1 = numeric(n_imputations)
+for (i in 1:n_imputations) {errors_femA1[i] = rf_models_femA1[[i]]$prediction.error}
+
+#OOB error berechnen Männer A1
+errors_maleA1 = numeric(n_imputations)
+for (j in 1:n_imputations) {errors_maleA1[j] = rf_models_maleA1[[j]]$prediction.error} 
+
+#Durchschnittliche Fehlerquote über alle RF-Modelle 
+mean_error_femA1 = mean(errors_femA1)
+mean_error_maleA1 = mean(errors_maleA1)
+
+# Variable Importance aus RF-Modellen (Frauen) ziehen und sammeln
+pVI_liste_femA1 = lapply(rf_models_femA1, function(model) model$variable.importance)
+pVI_femA1 = as.data.frame(do.call(cbind, pVI_liste_femA1))# Listen zu Dataframe zusammenfügen
+colnames(pVI_femA1) = paste0("Imputation_", 1:n_imputations)
+
+# Variable Importance aus RF-Modellen (Männer) ziehen und sammeln
+pVI_liste_maleA1 = lapply(rf_models_maleA1, function(model) model$variable.importance)
+pVI_maleA1 = as.data.frame(do.call(cbind, pVI_liste_maleA1))# Listen zu Dataframe zusammenfügen
+colnames(pVI_maleA1) = paste0("Imputation_", 1:n_imputations)
+
+# Ausgabe der pVI-Tabelle sortiert nach Wichtigkeit
+pVItable_meanfemA1 = sort(rowMeans(pVI_femA1), decreasing = TRUE)
+pVItable_meanmaleA1 = sort(rowMeans(pVI_maleA1), decreasing = TRUE)
+
+#Fertigstellung pVI-Tabelle Frauen
+pVItable_meanfemA1 = tibble(
+  Variable = names(pVItable_meanfemA1),
+  pVI = pVItable_meanfemA1)%>%
+  mutate(across(where(is.numeric), ~ round(., 3)))
+
+#Fertigstellung pVI-Tabelle Männer
+pVItable_meanmaleA1 = tibble(
+  Variable = names(pVItable_meanmaleA1),
+  pVI = pVItable_meanmaleA1)%>%
+  mutate(across(where(is.numeric), ~ round(., 3)))
+```
+```{r, eval=FALSE, echo=TRUE}
+## Logistische Regression
+
+#Frauen
+# Liste zur Speicherung der Tjur's R²-Werte für jeden Datensatz
+r2_tjur_list1.1 = numeric(n_imputations)
+r2_tjur_list1.2 = numeric(n_imputations)
+r2_tjur_list1.3 = numeric(n_imputations)
+
+#Berechnung der Tjur's R²-Werte für jede Imputation nach jedem Hinzufügen eines Prädiktors
+# und Erstellung der Modelle
+for (i in 1:n_imputations) {
+  fem_completed_data = complete(imp.female_A1, action = i)
+  #Erstellung der Modelle
+  model1.1 = glm(depression ~ lgmuscle, data = fem_completed_data, family = binomial)
+  r2_tjur_list1.1[[i]] = r2_tjur(model1.1)
+  model1.2 =  glm(depression ~ lgmuscle + bfi10_neuro_mod, data = fem_completed_data, family = binomial)
+  r2_tjur_list1.2[[i]] = r2_tjur(model1.2)
+  model1.3 =  glm(depression ~ lgmuscle + bfi10_neuro_mod + hc002_mod, data = fem_completed_data, family = binomial)
+  r2_tjur_list1.3[[i]] = r2_tjur(model1.3)}
+# Es wurden insgesamt 3 Listen erstellt mit jeweils 10 R²-Werten 
+# (eine Liste pro Model und 1 Wert pro imputiertem Datensatz)
+# finales Model: Model1.3
+
+#Ausgabe der Liste mit den durchschnittlichen R²-Werten
+mean_tjurR2_1.1 = mean(r2_tjur_list1.1)
+mean_tjurR2_1.2 = mean(r2_tjur_list1.2)
+mean_tjurR2_1.3 = mean(r2_tjur_list1.3)
+
+#Veränderung des R² nach stufenweisem Hinzufügen  der Prädiktoren (ΔR²) 
+female_Rsquare_change_list = c(mean_tjurR2_1.1, (mean_tjurR2_1.2 - mean_tjurR2_1.1), (mean_tjurR2_1.3 - mean_tjurR2_1.2))
+
+#Berechnung der Odds Ratios
+fem_odds_ratios = tidy(model1.3,conf.int = TRUE, exponentiate = TRUE)%>%
+  mutate(Group = "Frauen") #Gruppierung für Abb.2
+fem_odds_ratios
+
+
+#Männer
+# Liste zur Speicherung der Tjur's R²-Werte für jeden Datensatz
+r2_tjur_list2.1 = numeric(n_imputations)
+r2_tjur_list2.2 = numeric(n_imputations)
+r2_tjur_list2.3 = numeric(n_imputations)
+
+#Berechnung der Tjur's R²-Werte für jede Imputation nach jedem Hinzufügen eines Prädiktors
+# und Erstellung der Modelle
+for (i in 1:n_imputations) {
+  male_completed_data = complete(imp.male_A1, action = i)
+  #Erstellen der Modelle
+  model2.1 = glm(depression ~ lgmuscle, data = male_completed_data, family = binomial)
+  r2_tjur_list2.1[[i]] = r2_tjur(model2.1)
+  model2.2 =  glm(depression ~ lgmuscle + bfi10_neuro_mod, data = male_completed_data, family = binomial)
+  r2_tjur_list2.2[[i]] = r2_tjur(model2.2)
+  model2.3 =  glm(depression ~ lgmuscle + bfi10_neuro_mod + hc002_mod, data = male_completed_data, family = binomial)
+  r2_tjur_list2.3[[i]] = r2_tjur(model2.3)}
+# Es wurden für insgesamt 4 Listen erstellt mit jeweils 10 R²-Werten 
+# (eine Liste pro Model und 1 Wert pro imputiertem Datensatz)
+# finales Model: Model2.3
+
+#Ausgabe der Liste mit den durchschnittlichen R²-Werten
+mean_tjurR2_2.1 = mean(r2_tjur_list2.1)
+mean_tjurR2_2.2 = mean(r2_tjur_list2.2)
+mean_tjurR2_2.3 = mean(r2_tjur_list2.3)
+
+
+#Veränderung des R² nach stufenweisem Hinzufügen  der Prädiktoren (ΔR²) 
+male_Rsquare_change_list = c(mean_tjurR2_2.1, (mean_tjurR2_2.2 - mean_tjurR2_2.1), (mean_tjurR2_2.3 - mean_tjurR2_2.2))
+
+#Berechnung der Odds Ratios
+male_odds_ratios = tidy(model2.3,conf.int = TRUE, exponentiate = TRUE)%>%
+  mutate(Group = "Männer") #Gruppierung für Abb.2
+male_odds_ratios
+```
+```{r, eval=FALSE, echo=TRUE}
+##Abbildungen
+
+#Abb. 1: Mittelwert und Standardabweichung im Iterationsprozess
+plot(imp.female_A1)
+#Nutzung der Funktion in R-Studio: Export -> Save as Image 
+
+#Abb.2: Geschlechtsspezifische Odds Ratios für Depressionen
+combined_odds_ratios = bind_rows(male_odds_ratios,fem_odds_ratios)%>%
+  mutate(term = recode(term,
+                       "lgmuscle" = "Muskelschwäche-Index",
+                       "bfi10_neuro_mod" = "Neurotizismus",
+                       "hc002_mod"= "Anzahl der Arztkontakte"))%>%
+  filter(term != "(Intercept)")%>%
+  mutate(term = reorder(term, estimate, .desc = TRUE)) 
+#Erstellung des Forest Plots
+odds_ratios = ggplot(combined_odds_ratios, aes(x = term, y = estimate, ymin = conf.low, ymax = conf.high, color = Group)) +
+  geom_pointrange(position = position_dodge(width = 0.5)) +  
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  labs(x = "Prädiktoren",y = "Odds Ratio",color = "Gruppe") +
+  theme_minimal() +
+  coord_flip()+
+  scale_y_continuous(limits = c(0.5, 2))+
+  theme(axis.text.y = element_text(face = "bold"))
+# Ausgabe/Abspeichern der Abbildung
+odds_ratios
+#Nutzung der Funktion in R-Studio: Export -> Save as Image 
+
+#Tab.1:Übersicht deskriptiver Statistiken
+#Datensatzvorbereitung für Erstellung der Tabelle 1
+dataset_tab1 = dataset %>%
+  filter(wave == "8") %>%
+  select(-mergeid, -wave)%>%
+  mutate(co007_ = as.numeric(co007_))%>%
+  mutate(isced1997_r = as.numeric(isced1997_r))%>%
+  mutate(isced1997_r = case_when(
+    isced1997_r == 1 ~ 0,
+    isced1997_r == 2 ~ 1,
+    isced1997_r == 3 ~ 2,
+    isced1997_r == 4 ~ 3,
+    isced1997_r == 5 ~ 4,
+    isced1997_r == 6 ~ 5,
+    isced1997_r == 7 ~ 6,
+    TRUE ~ NA_real_))%>%
+  mutate(ep005_ = as.character(ep005_))%>%
+  mutate(female = recode(female,
+                         "male" = "Männer",
+                         "female" = "Frauen"))%>%
+  #Umbenennen/Übersetzen der Ausprägungen bestimmter Variablen
+  mutate(mar_stat = recode(mar_stat,
+                           "Married and living together with spouse"= "Verheiratet (zusammenlebend)",	
+                           "Registered partnership"= "Eingetragene Partnerschaft",
+                           "Married, living separated from spouse"= "Verheiratet (getrennt lebend)",	
+                           "Never married"= "Ledig",	
+                           "Divorced"= "Geschieden",	
+                           "Widowed"= "Verwitwet"))%>%
+  mutate(ep005_ = recode(ep005_,
+                         "retired" = "Pensioniert",
+                         "unemployed" = "Arbeitslos",
+                         "employed or self-employed" = "Angestellt/Selbstständig",
+                         "permanently sick or disabled" = "Dauerhaft krank / behindert",
+                         "homemaker" = "Hausfrau/-mann",
+                         "other" = "Sonstige"))
+
+#Erstellung der deskriptiven Tabelle 1
+tabelle1 = tbl_summary(dataset_tab1, by = female, missing = "no",#Vergleich geschlechterspezifisch
+                       statistic = list(
+                         all_continuous() ~ "{mean} ± {sd}",
+                         all_categorical() ~ "{n}" ,
+                         all_dichotomous() ~ "{n}"),
+                       #Manuelles Einsstellen der kategorialen Variablen zu kontinuierlichen Variablen
+                       type = list(
+                         isced1997_r ~ "continuous",
+                         chronic_mod ~ "continuous",
+                         iadlza ~ "continuous",
+                         lgmuscle ~ "continuous",
+                         finemotor ~ "continuous",
+                         orienti ~ "continuous",
+                         co007_ ~ "continuous",
+                         numeracy_2 ~ "continuous",
+                         bfi10_neuro_mod ~ "continuous",
+                         bfi10_agree_mod ~ "continuous",
+                         bfi10_extra_mod ~ "continuous",
+                         bfi10_consc_mod ~ "continuous",
+                         bfi10_open_mod ~ "continuous"),
+                       #Umbennen/Übersetzen der Bezeichnungen einzelner Variablen
+                       label = list(
+                         age ~ "Alter",
+                         isced1997_r ~ "Bildungsniveau (ISCED 1997) (0-6)",
+                         eduyears_mod ~ "Anzahl der Bildungsjahre",
+                         mar_stat ~ "Familienstand",
+                         hhsize ~ "Haushaltsgröße",
+                         ch001_ ~ "Anzahl der Kinder",
+                         ch021_mod ~ "Anzahl der Enkelkinder",
+                         ch007_hh ~ "Kinder im Haushalt",
+                         mother_alive ~ "Mutter am Leben",
+                         father_alive ~ "Vater am Leben",
+                         sp002_mod ~ "Unterstützung erhalten",
+                         sp008_ ~ "Unterstützung geleistet",
+                         income_pct_w8 ~ "Einkommensperzentil Haushalt (1-10)",
+                         co007_ ~ "Auskommen mit dem Haushaltseinkommen (1-4)",
+                         ep005_ ~ "Beschäftigungsstatus",
+                         chronic_mod ~ "Anzahl der chronischen Erkrankungen",
+                         bmi ~ "BMI (kg/m²)",
+                         hc002_mod ~ "Arztkontakte",
+                         iadlza ~ "IADL (0-5)",
+                         lgmuscle ~ "Muskelschwäche-Index (0-4)",
+                         finemotor ~ "Feinmotorik (0-3)",
+                         maxgrip ~ "Maximale Griffkraft (kg)",
+                         ever_smoked ~ "Hat jemals täglich geraucht",
+                         recall_1 ~ "Gedächtnisleistung (0-10)",
+                         orienti ~ "Orientierung (0-4)",
+                         numeracy_2 ~ "Rechenfähigkeiten (0-5)",
+                         bfi10_neuro_mod ~ "Neurotizismus (1-5)",
+                         bfi10_extra_mod ~ "Extraversion (1-5)",
+                         bfi10_open_mod ~ "Offenheit (1-5)",
+                         bfi10_consc_mod ~ "Gewissenhaftigkeit (1-5)",
+                         bfi10_agree_mod ~ "Verträglichkeit (1-5)",
+                         depression ~ "Depression"))%>%
+  bold_labels()%>%
+  add_overall()%>%
+  modify_header(stat_0 ~ "**Insgesamt N = {N}**")%>%
+  modify_header(label = "**Risiko-/Schutzfaktoren**")%>%
+  modify_table_styling(columns = c("stat_1", "stat_2"), footnote = NA)
+
+# Ausgabe/Abspeichern der Tabelle
+tabelle1
+##Nutzung der Funktion in R-Studio: Export -> Save as Image
+
+
+#Tab.2: Top 5 Prädiktoren für Depressionen 
+#Frauen
+top5_pVI_table_fem <- pVItable_meanfemA1 %>%
+  slice_head(n = 5) %>%
+  mutate(Variable = recode(Variable,
+                           "lgmuscle" = "Muskelschwäche-Index",
+                           "bfi10_neuro_mod" = "Neurotizismus",
+                           "age" ="Alter",
+                           "maxgrip" = "Maximale Griffkraft",
+                           "hc002_mod"= "Anzahl der Arztkontakte"))
+top5_pVI_table_fem = top5_pVI_table_fem %>%
+  gt() %>%
+  tab_header(title = "Frauen") %>%
+  cols_label(Variable = "Variable", pVI = "pVI" ) %>%
+  fmt_number(columns = vars(pVI), decimals = 3) %>%
+  tab_style( style = cell_text(weight = "bold"),
+             locations = cells_title(groups = "title")) %>%
+  tab_style( style = cell_text(weight = "bold"),
+             locations = cells_column_labels(columns = vars(Variable, pVI)))
+#Ausgabe/Abspeichern der Tabelle
+top5_pVI_table_fem
+#Nutzung der Funktion in R-Studio: Export -> Save as Image 
+
+#Männer
+top5_pVI_table_men = pVItable_meanmaleA1 %>%
+  slice_head(n = 5) %>%
+  mutate(Variable = recode(Variable,
+                           "lgmuscle" = "Muskelschwäche-Index",
+                           "bfi10_neuro_mod" = "Neurotizismus",
+                           "age" ="Alter",
+                           "iadlza" = "IADL-Index",
+                           "hc002_mod"= "Anzahl der Arztkontakte"))
+top5_pVI_table_men = top5_pVI_table_men %>%
+  gt() %>%
+  tab_header(title = "Männer") %>%
+  cols_label(Variable = "Variable", pVI = "pVI" ) %>%
+  fmt_number(columns = vars(pVI), decimals = 3) %>%
+  tab_style( style = cell_text(weight = "bold"),
+             locations = cells_title(groups = "title")) %>%
+  tab_style( style = cell_text(weight = "bold"),
+             locations = cells_column_labels(columns = vars(Variable, pVI)))
+#Ausgabe/Abspeichern der Tabelle
+top5_pVI_table_men
+#Nutzung der Funktion in R-Studio: Export -> Save as Image 
+
+```
+
