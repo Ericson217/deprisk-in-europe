@@ -2,7 +2,7 @@
 
 ## Maschinelles Lernen zur geschlechtsspezifischen Identifikation von Depressionsrisiken
 
-Dieses Repository enthält die Datenanalyse und den Code für die Seminararbeit im Bereich Gesundheitsökonomie an der Bergischen Universität Wuppertal. Die Arbeit untersucht die Prädiktoren für klinische Depressionen bei Erwachsenen mittleren und höheren Alters in Europa unter Anwendung eines hybriden Machine-Learning-Ansatzes.
+Dieses Repository enthält die Datenanalyse und den Code für die Seminararbeit im Bereich Gesundheitsökonomie. Die Arbeit untersucht die Prädiktoren für klinische Depressionen bei Erwachsenen mittleren und höheren Alters in Europa unter Anwendung eines hybriden Machine-Learning-Ansatzes.
 
 ## 📋 Projektübersicht
 
